@@ -1,5 +1,11 @@
 #include <Arduino.h>
 
+#define BLYNK_PRINT Serial
+
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <BlynkSimpleEsp32.h>
+
 #include "soc/timer_group_struct.h"
 #include "soc/timer_group_reg.h"
 
@@ -70,6 +76,7 @@ MPU6050 mpu;
 
 const uint8_t NUM_SAMPLES = 50;
 const uint8_t SAMPLE_SIZE = 150;
+const uint32_t STAND_TIME_MS = 5000;
 
 // MPU control/status vars
 bool dmpReady = false;  // set true if DMP init was successful
@@ -100,9 +107,29 @@ TaskHandle_t taskWriteSD;
 TaskHandle_t taskReadMPU;
 SemaphoreHandle_t xMutex = NULL;
 
+char auth[] = "y3MCmP11GOPvWq7IlqXfhNbT_txlfixE";
+
+char ssid[] = "jualabs";
+char pass[] = "#jualabsufrpe#";
+
+WidgetLCD lcd(V1);
+bool pressed = false;
+uint32_t start = 0;
+typedef enum {
+    WAIT_START,
+    STAND_TIME,
+    WALKING,
+    STOPPED
+} read_states_t;
+
 // ================================================================
 // ===               INTERRUPT DETECTION ROUTINE                ===
 // ================================================================
+
+BLYNK_WRITE(V0) {
+  // int pinValue = param.asInt(); // assigning incoming value from pin V1 to a variable
+  pressed = true;
+}
 
 volatile bool mpuInterrupt = false;     // indicates whether MPU interrupt pin has gone high
 void IRAM_ATTR dmpDataReady() {
@@ -134,74 +161,104 @@ void appendFile(fs::FS &fs, const char *path, const char *message)
 // ================================================================
 
 //Task1code: blinks an LED every 1000 ms
-void readMPU( void * pvParameters ){
+void readMPU( void * pvParameters ) {
+
+  read_states_t read_state = WAIT_START;
+
   Serial.print("readMPU running on core ");
   Serial.println(xPortGetCoreID());
 
-  for(;;){
-    // if programming failed, don't try to do anything
-    if (!dmpReady) return;
+  for(;;) {
+    delay(1);
+    switch(read_state) {
+      case WAIT_START:
+        if(pressed == true) {
+          start = millis();
+          pressed = false;
+          lcd.clear();
+          lcd.print(0, 0, "waiting...");
+          read_state = STAND_TIME;
+        }
+        break;
+      case STAND_TIME:
+        if((millis() - start) > STAND_TIME_MS) {
+          lcd.clear();
+          lcd.print(0, 0, "WALK!!!");
+          read_state = WALKING;
+        }
+        break;
+      case WALKING:
+        if(pressed == true) {
+          lcd.clear(); //Use it to clear the LCD Widget
+          lcd.print(0, 0, "finishing"); // use: (position X: 0-15, position Y: 0-1, "Message you want to print")
+          lcd.print(0, 1, "experiment!"); // use: (position X: 0-15, position Y: 0-1, "Message you want to print")
+          pressed = false;
+          read_state = STOPPED;
+        }
+        else {
+          // if programming failed, don't try to do anything
+          if (!dmpReady) return;
 
-    // wait for MPU interrupt or extra packet(s) available
-    while (!mpuInterrupt && fifoCount < packetSize) {
-        if (mpuInterrupt && fifoCount < packetSize) {
-          // try to get out of the infinite loop 
+          // wait for MPU interrupt or extra packet(s) available
+          while (!mpuInterrupt && fifoCount < packetSize) {
+              if (mpuInterrupt && fifoCount < packetSize) {
+                // try to get out of the infinite loop 
+                fifoCount = mpu.getFIFOCount();
+              }  
+          }
+
+          // reset interrupt flag and get INT_STATUS byte
+          mpuInterrupt = false;
+          mpuIntStatus = mpu.getIntStatus();
+
+          // get current FIFO count
           fifoCount = mpu.getFIFOCount();
-        }  
-        // other program behavior stuff here
-        // .
-        // .
-        // .
-        // if you are really paranoid you can frequently test in between other
-        // stuff to see if mpuInterrupt is true, and if so, "break;" from the
-        // while() loop to immediately process the MPU data
-        // .
-        // .
-        // .
-    }
 
-    // reset interrupt flag and get INT_STATUS byte
-    mpuInterrupt = false;
-    mpuIntStatus = mpu.getIntStatus();
+          // check for overflow (this should never happen unless our code is too inefficient)
+          if ((mpuIntStatus & _BV(MPU6050_INTERRUPT_FIFO_OFLOW_BIT)) || fifoCount >= 1024) {
+              // reset so we can continue cleanly
+              mpu.resetFIFO();
+              fifoCount = mpu.getFIFOCount();
+              Serial.println(F("FIFO overflow!"));
 
-    // get current FIFO count
-    fifoCount = mpu.getFIFOCount();
+          // otherwise, check for DMP data ready interrupt (this should happen frequently)
+          } else if (mpuIntStatus & _BV(MPU6050_INTERRUPT_DMP_INT_BIT)) {
+              // wait for correct available data length, should be a VERY short wait
+              while (fifoCount < packetSize) fifoCount = mpu.getFIFOCount();
 
-    // check for overflow (this should never happen unless our code is too inefficient)
-    if ((mpuIntStatus & _BV(MPU6050_INTERRUPT_FIFO_OFLOW_BIT)) || fifoCount >= 1024) {
-        // reset so we can continue cleanly
-        mpu.resetFIFO();
-        fifoCount = mpu.getFIFOCount();
-        Serial.println(F("FIFO overflow!"));
+              uint8_t num_pkgs = fifoCount/packetSize;
 
-    // otherwise, check for DMP data ready interrupt (this should happen frequently)
-    } else if (mpuIntStatus & _BV(MPU6050_INTERRUPT_DMP_INT_BIT)) {
-        // wait for correct available data length, should be a VERY short wait
-        while (fifoCount < packetSize) fifoCount = mpu.getFIFOCount();
-
-        uint8_t num_pkgs = fifoCount/packetSize;
-
-        for(int i = 0; i < num_pkgs; i++) {
-          if(sample_counter < NUM_SAMPLES) {
-            // read a packet from FIFO
-            mpu.getFIFOBytes(fifoBuffer, packetSize);
-            mpu.dmpGetAccel(&aa, fifoBuffer);
-            mpu.dmpGetGyro(&gy, fifoBuffer);
-            sprintf(sample_str[write_index], "%u;%f;%f;%f;%f;%f;%f\n",
-              packet_counter++,
-              aa.x * ACCEL_FACTOR, aa.y * ACCEL_FACTOR, aa.z * ACCEL_FACTOR,
-              gy.x * GYRO_FACTOR, gy.y * GYRO_FACTOR, gy.z * GYRO_FACTOR);
-            // Serial.print(sample_str[write_index]);
-            write_index++;
-            write_index %= NUM_SAMPLES;
-            xSemaphoreTake(xMutex,portMAX_DELAY);
-            sample_counter++;
-            xSemaphoreGive(xMutex);
+              for(int i = 0; i < num_pkgs; i++) {
+                if(sample_counter < NUM_SAMPLES) {
+                  // read a packet from FIFO
+                  mpu.getFIFOBytes(fifoBuffer, packetSize);
+                  mpu.dmpGetAccel(&aa, fifoBuffer);
+                  mpu.dmpGetGyro(&gy, fifoBuffer);
+                  sprintf(sample_str[write_index], "%u;%f;%f;%f;%f;%f;%f\n",
+                    packet_counter++,
+                    aa.x * ACCEL_FACTOR, aa.y * ACCEL_FACTOR, aa.z * ACCEL_FACTOR,
+                    gy.x * GYRO_FACTOR, gy.y * GYRO_FACTOR, gy.z * GYRO_FACTOR);
+                  // Serial.print(sample_str[write_index]);
+                  write_index++;
+                  write_index %= NUM_SAMPLES;
+                  xSemaphoreTake(xMutex,portMAX_DELAY);
+                  sample_counter++;
+                  xSemaphoreGive(xMutex);
+                }
+                else {
+                  Serial.println("buffer cheio!");
+                }
+              }     
           }
-          else {
-            Serial.println("buffer cheio!");
-          }
-        }     
+        }
+        break;
+      case STOPPED:
+        lcd.clear(); //Use it to clear the LCD Widget
+        lcd.print(0, 0, "STOPPED!"); // use: (position X: 0-15, position Y: 0-1, "Message you want to print")
+        read_state = STOPPED;
+        break;
+      default:
+        break;
     }
   } 
 }
@@ -263,7 +320,10 @@ void setup() {
     // (115200 chosen because it is required for Teapot Demo output, but it's
     // really up to you depending on your project)
     Serial.begin(115200);
-    while (!Serial); // wait for Leonardo enumeration, others continue immediately
+    while (!Serial); // wait for Leonardo enumeration, others continue immediate
+
+    // start blynk server
+    Blynk.begin(auth, ssid, pass);
 
     // NOTE: 8MHz or slower host processors, like the Teensy @ 3.3V or Arduino
     // Pro Mini running at 3.3V, cannot handle this baud rate reliably due to
@@ -280,11 +340,21 @@ void setup() {
     Serial.println(F("Testing device connections..."));
     Serial.println(mpu.testConnection() ? F("MPU6050 connection successful") : F("MPU6050 connection failed"));
 
+    // write a separation line
+    appendFile(SD, "/mpu-data.txt", "-----");
+
     // wait for ready
     Serial.println(F("\nSend any character to begin DMP programming and demo: "));
-    while (Serial.available() && Serial.read()); // empty buffer
-    while (!Serial.available());                 // wait for data
-    while (Serial.available() && Serial.read()); // empty buffer again
+    // while (Serial.available() && Serial.read()); // empty buffer
+    // while (!Serial.available());                 // wait for data
+    // while (Serial.available() && Serial.read()); // empty buffer again
+    lcd.clear(); //Use it to clear the LCD Widget
+    lcd.print(0, 0, "press button"); // use: (position X: 0-15, position Y: 0-1, "Message you want to print")
+    lcd.print(0, 1, "to calibrate...");
+    while(pressed == false) Blynk.run();
+    pressed = false;
+    lcd.clear(); //Use it to clear the LCD Widget
+    lcd.print(0, 0, "calibrating..."); // use: (position X: 0-15, position Y: 0-1, "Message you want to print")
 
     // load and configure the DMP
     Serial.println(F("Initializing DMP..."));
@@ -364,6 +434,9 @@ void setup() {
       }
 
     packet_counter = 0;
+    lcd.clear(); //Use it to clear the LCD Widget
+    lcd.print(0, 0, "press button"); // use: (position X: 0-15, position Y: 0-1, "Message you want to print")
+    lcd.print(0, 1, "to start...");
 }
 
 // ================================================================
@@ -371,6 +444,7 @@ void setup() {
 // ================================================================
 
 void loop() {
+  Blynk.run();
   TIMERG0.wdt_wprotect=TIMG_WDT_WKEY_VALUE;
   TIMERG0.wdt_feed=1;
   TIMERG0.wdt_wprotect=0;
